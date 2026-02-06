@@ -1,0 +1,23 @@
+{
+  "id": "gemini-file-search",
+  "name": "Gemini File Search",
+  "description": "Semantic document search powered by Gemini File Search API.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "defaultModel": {
+        "type": "string",
+        "description": "Gemini model for generating answers (default: gemini-2.5-flash)."
+      },
+      "maxStoresPerQuery": {
+        "type": "number",
+        "description": "Max stores per query (default: 5, hard limit: 5)."
+      },
+      "timeoutMs": {
+        "type": "number",
+        "description": "HTTP request timeout in milliseconds (default: 30000)."
+      }
+    }
+  }
+}

@@ -319,6 +319,12 @@ importers:
         specifier: workspace:*
         version: link:../..
 
+  extensions/gemini-file-search:
+    devDependencies:
+      openclaw:
+        specifier: workspace:*
+        version: link:../..
+
   extensions/google-antigravity-auth:
     devDependencies:
       openclaw:
