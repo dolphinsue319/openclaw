@@ -1,4 +1,5 @@
-import type { OpenClawConfig } from "../../../src/config/config.js";
+import { createRequire } from "node:module";
+import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import type {
   FileSearchStore,
   GenerateContentResponse,
@@ -31,6 +32,22 @@ type RequireApiKeyFn = (auth: ResolvedProviderAuth, provider: string) => string;
 let _resolveApiKeyForProvider: ResolveApiKeyForProviderFn | undefined;
 let _requireApiKey: RequireApiKeyFn | undefined;
 
+function extractModelAuth(mod: Record<string, unknown>): {
+  resolveApiKeyForProvider: ResolveApiKeyForProviderFn;
+  requireApiKey: RequireApiKeyFn;
+} | null {
+  if (
+    typeof mod.resolveApiKeyForProvider === "function" &&
+    typeof mod.requireApiKey === "function"
+  ) {
+    return {
+      resolveApiKeyForProvider: mod.resolveApiKeyForProvider as ResolveApiKeyForProviderFn,
+      requireApiKey: mod.requireApiKey as RequireApiKeyFn,
+    };
+  }
+  return null;
+}
+
 async function loadModelAuth(): Promise<{
   resolveApiKeyForProvider: ResolveApiKeyForProviderFn;
   requireApiKey: RequireApiKeyFn;
@@ -39,38 +56,43 @@ async function loadModelAuth(): Promise<{
     return { resolveApiKeyForProvider: _resolveApiKeyForProvider, requireApiKey: _requireApiKey };
   }
 
-  // Source checkout (dev/tests)
-  try {
-    const mod = await import("../../../src/agents/model-auth.js");
-    if (
-      typeof mod.resolveApiKeyForProvider === "function" &&
-      typeof mod.requireApiKey === "function"
-    ) {
-      _resolveApiKeyForProvider = mod.resolveApiKeyForProvider;
-      _requireApiKey = mod.requireApiKey;
-      return {
-        resolveApiKeyForProvider: mod.resolveApiKeyForProvider,
-        requireApiKey: mod.requireApiKey,
-      };
+  // Try relative paths first (works when plugin lives inside the monorepo)
+  for (const relPath of ["../../../src/agents/model-auth.js", "../../../agents/model-auth.js"]) {
+    try {
+      const mod = await import(relPath);
+      const result = extractModelAuth(mod);
+      if (result) {
+        _resolveApiKeyForProvider = result.resolveApiKeyForProvider;
+        _requireApiKey = result.requireApiKey;
+        return result;
+      }
+    } catch {
+      // ignore — try next path
     }
-  } catch {
-    // ignore — try bundled path
   }
 
-  // Bundled install (dist)
-  const mod = await import("../../../agents/model-auth.js");
-  if (
-    typeof mod.resolveApiKeyForProvider !== "function" ||
-    typeof mod.requireApiKey !== "function"
-  ) {
-    throw new Error("Internal error: model-auth not available");
+  // Fallback: resolve via openclaw package (works when plugin is in ~/.openclaw/extensions/)
+  try {
+    const require = createRequire(import.meta.url);
+    const openclawRoot = require.resolve("openclaw").replace(/[/\\][^/\\]+$/, "");
+    for (const sub of ["agents/model-auth.js", "src/agents/model-auth.js"]) {
+      try {
+        const mod = await import(`${openclawRoot}/${sub}`);
+        const result = extractModelAuth(mod);
+        if (result) {
+          _resolveApiKeyForProvider = result.resolveApiKeyForProvider;
+          _requireApiKey = result.requireApiKey;
+          return result;
+        }
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
   }
-  _resolveApiKeyForProvider = mod.resolveApiKeyForProvider;
-  _requireApiKey = mod.requireApiKey;
-  return {
-    resolveApiKeyForProvider: mod.resolveApiKeyForProvider,
-    requireApiKey: mod.requireApiKey,
-  };
+
+  throw new Error("Internal error: model-auth not available");
 }
 
 function resolveBaseUrl(config?: OpenClawConfig): string {

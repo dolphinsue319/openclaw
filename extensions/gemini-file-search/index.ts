@@ -1,4 +1,4 @@
-import type { OpenClawPluginApi } from "../../src/plugins/types.js";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createListStoresTool } from "./src/list-stores-tool.js";
 import { createQueryTool } from "./src/query-tool.js";
 

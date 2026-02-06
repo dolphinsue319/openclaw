@@ -1,6 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import type { OpenClawPluginApi } from "../../../src/plugins/types.js";
-import type { OpenClawPluginToolContext } from "../../../src/plugins/types.js";
+import type { OpenClawPluginApi, OpenClawPluginToolContext } from "openclaw/plugin-sdk";
 import type { PluginCfg } from "./types.js";
 import { queryFileSearch } from "./gemini-client.js";
 
