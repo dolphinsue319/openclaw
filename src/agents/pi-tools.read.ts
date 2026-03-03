@@ -1,10 +1,19 @@
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { createEditTool, createReadTool, createWriteTool } from "@mariozechner/pi-coding-agent";
+import {
+  SafeOpenError,
+  openFileWithinRoot,
+  readFileWithinRoot,
+  writeFileWithinRoot,
+} from "../infra/fs-safe.js";
 import { detectMime } from "../media/mime.js";
 import { sniffMimeFromBase64 } from "../media/sniff-mime-from-base64.js";
 import type { ImageSanitizationLimits } from "./image-sanitization.js";
+import { toRelativeWorkspacePath } from "./path-policy.js";
 import type { AnyAgentTool } from "./pi-tools.types.js";
 import { assertSandboxPath } from "./sandbox-paths.js";
 import type { SandboxFsBridge } from "./sandbox/fs-bridge.js";
@@ -665,6 +674,95 @@ export function createSandboxedEditTool(params: SandboxToolParams) {
   return wrapToolParamNormalization(base, CLAUDE_PARAM_GROUPS.edit);
 }
 
+export function createHostWorkspaceWriteTool(root: string, options?: { workspaceOnly?: boolean }) {
+  const base = createWriteTool(root, {
+    operations: createHostWriteOperations(root, options),
+  }) as unknown as AnyAgentTool;
+  return wrapToolParamNormalization(base, CLAUDE_PARAM_GROUPS.write);
+}
+
+/** Resolve path for host edit: expand ~ and resolve relative paths against root. */
+function resolveHostEditPath(root: string, pathParam: string): string {
+  const expanded =
+    pathParam.startsWith("~/") || pathParam === "~"
+      ? pathParam.replace(/^~/, os.homedir())
+      : pathParam;
+  return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(root, expanded);
+}
+
+/**
+ * When the upstream edit tool throws after having already written (e.g. generateDiffString fails),
+ * the file may be correctly updated but the tool reports failure. This wrapper catches errors and
+ * if the target file on disk contains the intended newText, returns success so we don't surface
+ * a false "edit failed" to the user (fixes #32333, same pattern as #30773 for write).
+ */
+function wrapHostEditToolWithPostWriteRecovery(base: AnyAgentTool, root: string): AnyAgentTool {
+  return {
+    ...base,
+    execute: async (
+      toolCallId: string,
+      params: unknown,
+      signal: AbortSignal | undefined,
+      onUpdate?: (update: unknown) => void,
+    ) => {
+      try {
+        return await base.execute(toolCallId, params, signal, onUpdate);
+      } catch (err) {
+        const record =
+          params && typeof params === "object" ? (params as Record<string, unknown>) : undefined;
+        const pathParam = record && typeof record.path === "string" ? record.path : undefined;
+        const newText =
+          record && typeof record.newText === "string"
+            ? record.newText
+            : record && typeof record.new_string === "string"
+              ? record.new_string
+              : undefined;
+        const oldText =
+          record && typeof record.oldText === "string"
+            ? record.oldText
+            : record && typeof record.old_string === "string"
+              ? record.old_string
+              : undefined;
+        if (!pathParam || !newText) {
+          throw err;
+        }
+        try {
+          const absolutePath = resolveHostEditPath(root, pathParam);
+          const content = await fs.readFile(absolutePath, "utf-8");
+          // Only recover when the replacement likely occurred: newText is present and oldText
+          // is no longer present. This avoids false success when upstream threw before writing
+          // (e.g. oldText not found) but the file already contained newText (review feedback).
+          const hasNew = content.includes(newText);
+          const stillHasOld =
+            oldText !== undefined && oldText.length > 0 && content.includes(oldText);
+          if (hasNew && !stillHasOld) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Successfully replaced text in ${pathParam}.`,
+                },
+              ],
+              details: { diff: "", firstChangedLine: undefined },
+            } as AgentToolResult<unknown>;
+          }
+        } catch {
+          // File read failed or path invalid; rethrow original error.
+        }
+        throw err;
+      }
+    },
+  };
+}
+
+export function createHostWorkspaceEditTool(root: string, options?: { workspaceOnly?: boolean }) {
+  const base = createEditTool(root, {
+    operations: createHostEditOperations(root, options),
+  }) as unknown as AnyAgentTool;
+  const withRecovery = wrapHostEditToolWithPostWriteRecovery(base, root);
+  return wrapToolParamNormalization(withRecovery, CLAUDE_PARAM_GROUPS.edit);
+}
+
 export function createOpenClawReadTool(
   base: AnyAgentTool,
   options?: OpenClawReadToolOptions,
@@ -736,6 +834,116 @@ function createSandboxEditOperations(params: SandboxToolParams) {
       const stat = await params.bridge.stat({ filePath: absolutePath, cwd: params.root });
       if (!stat) {
         throw createFsAccessError("ENOENT", absolutePath);
+      }
+    },
+  } as const;
+}
+
+async function writeHostFile(absolutePath: string, content: string) {
+  const resolved = path.resolve(absolutePath);
+  await fs.mkdir(path.dirname(resolved), { recursive: true });
+  await fs.writeFile(resolved, content, "utf-8");
+}
+
+function createHostWriteOperations(root: string, options?: { workspaceOnly?: boolean }) {
+  const workspaceOnly = options?.workspaceOnly ?? false;
+
+  if (!workspaceOnly) {
+    // When workspaceOnly is false, allow writes anywhere on the host
+    return {
+      mkdir: async (dir: string) => {
+        const resolved = path.resolve(dir);
+        await fs.mkdir(resolved, { recursive: true });
+      },
+      writeFile: writeHostFile,
+    } as const;
+  }
+
+  // When workspaceOnly is true, enforce workspace boundary
+  return {
+    mkdir: async (dir: string) => {
+      const relative = toRelativeWorkspacePath(root, dir, { allowRoot: true });
+      const resolved = relative ? path.resolve(root, relative) : path.resolve(root);
+      await assertSandboxPath({ filePath: resolved, cwd: root, root });
+      await fs.mkdir(resolved, { recursive: true });
+    },
+    writeFile: async (absolutePath: string, content: string) => {
+      const relative = toRelativeWorkspacePath(root, absolutePath);
+      await writeFileWithinRoot({
+        rootDir: root,
+        relativePath: relative,
+        data: content,
+        mkdir: true,
+      });
+    },
+  } as const;
+}
+
+function createHostEditOperations(root: string, options?: { workspaceOnly?: boolean }) {
+  const workspaceOnly = options?.workspaceOnly ?? false;
+
+  if (!workspaceOnly) {
+    // When workspaceOnly is false, allow edits anywhere on the host
+    return {
+      readFile: async (absolutePath: string) => {
+        const resolved = path.resolve(absolutePath);
+        return await fs.readFile(resolved);
+      },
+      writeFile: writeHostFile,
+      access: async (absolutePath: string) => {
+        const resolved = path.resolve(absolutePath);
+        await fs.access(resolved);
+      },
+    } as const;
+  }
+
+  // When workspaceOnly is true, enforce workspace boundary
+  return {
+    readFile: async (absolutePath: string) => {
+      const relative = toRelativeWorkspacePath(root, absolutePath);
+      const safeRead = await readFileWithinRoot({
+        rootDir: root,
+        relativePath: relative,
+      });
+      return safeRead.buffer;
+    },
+    writeFile: async (absolutePath: string, content: string) => {
+      const relative = toRelativeWorkspacePath(root, absolutePath);
+      await writeFileWithinRoot({
+        rootDir: root,
+        relativePath: relative,
+        data: content,
+        mkdir: true,
+      });
+    },
+    access: async (absolutePath: string) => {
+      let relative: string;
+      try {
+        relative = toRelativeWorkspacePath(root, absolutePath);
+      } catch {
+        // Path escapes workspace root.  Don't throw here – the upstream
+        // library replaces any `access` error with a misleading "File not
+        // found" message.  By returning silently the subsequent `readFile`
+        // call will throw the same "Path escapes workspace root" error
+        // through a code-path that propagates the original message.
+        return;
+      }
+      try {
+        const opened = await openFileWithinRoot({
+          rootDir: root,
+          relativePath: relative,
+        });
+        await opened.handle.close().catch(() => {});
+      } catch (error) {
+        if (error instanceof SafeOpenError && error.code === "not-found") {
+          throw createFsAccessError("ENOENT", absolutePath);
+        }
+        if (error instanceof SafeOpenError && error.code === "outside-workspace") {
+          // Don't throw here – see the comment above about the upstream
+          // library swallowing access errors as "File not found".
+          return;
+        }
+        throw error;
       }
     },
   } as const;
